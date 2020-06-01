@@ -100,6 +100,7 @@ usage() {
     echo "      --inetproto protocol         Force IP version 4 or 6"
     echo "   -i,--issuer issuer              pattern to match the issuer of the certificate"
     echo "      --issuer-cert-cache dir      directory where to store issuer certificates cache"
+    echo "      --issuer-check-exp           check issuer certificates expiration"
     echo "   -K,--clientkey path             use client certificate key to authenticate"
     echo "   -L,--check-ssl-labs grade       SSL Labs assessment"
     echo "                                   (please check https://www.ssllabs.com/about/terms.html)"
@@ -880,6 +881,102 @@ check_option_argument() {
 }
 
 ################################################################################
+# Checks the expiration of a cerfiticate
+#
+# Params
+#  $1 file
+#  $2 optional description for messages
+
+check_certificate_expiration() {
+
+    if [ -n "${2}" ]; then
+        PREFIX="${2}"
+    fi
+
+    if [ -n "${DEBUG}" ] ; then
+        echo "[DBG] Checking expiration date"
+    fi
+
+    if [ "${OPENSSL_COMMAND}" = "x509" ]; then
+
+        # x509 certificates (default)
+
+        # We always check expired certificates
+        if ! ${OPENSSL} x509 -in "${1}" -noout -checkend 0 > /dev/null ; then
+            prepend_critical_message "${OPENSSL_COMMAND} ${PREFIX}certificate is expired (was valid until ${DATE})"
+        fi
+
+        if [ -n "${CRITICAL}" ] ; then
+
+            if [ -n "${DEBUG}" ] ; then
+                echo "[DBG] critical = ${CRITICAL}"
+                echo "[DBG] executing: ${OPENSSL} x509 -in ${1} -noout -checkend $(( CRITICAL * 86400 ))"
+            fi
+
+            if ! ${OPENSSL} x509 -in "${1}" -noout -checkend $(( CRITICAL * 86400 )) > /dev/null ; then
+                EXPIRES=1
+                prepend_critical_message "${OPENSSL_COMMAND} ${PREFIX}certificate will expire in ${DAYS_VALID} day(s) on ${DATE}"
+            fi
+
+        fi
+
+        if [ -n "${WARNING}" ] && [ -z "${EXPIRES}" ] ; then
+
+            if [ -n "${DEBUG}" ] ; then
+                echo "[DBG] executing: ${OPENSSL} x509 -in ${1} -noout -checkend $(( WARNING * 86400 ))"
+            fi
+
+            if ! ${OPENSSL} x509 -in "${1}" -noout -checkend $(( WARNING * 86400 )) > /dev/null ; then
+                append_warning_message "${OPENSSL_COMMAND} ${PREFIX}certificate will expire in ${DAYS_VALID} day(s) on ${DATE}"
+            fi
+
+        fi
+
+    if [ -n "${NOT_VALID_LONGER_THAN}" ] ; then
+
+            if [ -n "${DEBUG}" ] ; then
+                echo "[DBG] checking if the certificate is valid longer than ${NOT_VALID_LONGER_THAN} days"
+                echo "[DBG]   valid for ${DAYS_VALID} days"
+            fi
+
+    if [ "${DAYS_VALID}" -gt "${NOT_VALID_LONGER_THAN}" ] ; then
+
+        if [ -n "${DEBUG}" ] ; then
+            echo "[DBG] Certificate expires in ${DAYS_VALID} days which is more than ${NOT_VALID_LONGER_THAN} days"
+        fi
+
+        prepend_critical_message "Certificate expires in ${DAYS_VALID} days which is more than ${NOT_VALID_LONGER_THAN} days"
+    fi
+
+    fi
+
+    elif [ "${OPENSSL_COMMAND}" = "crl" ]; then
+
+        # CRL certificates
+
+        # We always check expired certificates
+        if [ "${DAYS_VALID}" -lt 1 ] ; then
+            prepend_critical_message "${OPENSSL_COMMAND} ${PREFIX}certificate is expired (was valid until ${DATE})"
+        fi
+
+        if [ -n "${CRITICAL}" ] ; then
+            if [ "${DAYS_VALID}" -lt "${CRITICAL}" ] ; then
+                EXPIRES=1
+                prepend_critical_message "${OPENSSL_COMMAND} ${PREFIX}certificate will expire in ${DAYS_VALID} day(s) on ${DATE}"
+            fi
+        fi
+
+        if [ -n "${WARNING}" ]  && [ -z "${EXPIRES}" ] ; then
+            if [ "${DAYS_VALID}" -lt "${WARNING}" ] ; then
+                append_warning_message "${OPENSSL_COMMAND} ${PREFIX}certificate will expire in ${DAYS_VALID} day(s) on ${DATE}"
+            fi
+
+        fi
+    fi
+}
+
+
+################################################################################
 # Main
 ################################################################################
 main() {
@@ -1160,6 +1257,10 @@ main() {
                 check_option_argument '--issuer-cert-cache' "$2"
                 ISSUER_CERT_CACHE="$2"
                 shift 2
+                ;;
+            --issuer-check-exp)
+                ISSUER_CHECK_EXPIRE=1
+                shift
                 ;;
             -L|--check-ssl-labs)
                 check_option_argument '-L|--check-ssl-labs' "$2"
@@ -1895,7 +1996,7 @@ main() {
     fi
 
     HTTP_REQUEST="${HTTP_METHOD} / HTTP/1.1\\nHost: ${HOST_HEADER}\\nUser-Agent: check_ssl_cert/${VERSION}\\nConnection: close\\n\\n"
-    
+
     ##############################################################################
     # Check for disallowed protocols
     if [ -n "${DISALLOWED_PROTOCOLS}" ] ; then
@@ -1907,11 +2008,11 @@ main() {
 	    fi
 	    NMAP_INETPROTO='-6'
 	fi
-	
+
 	if [ -n "${DEBUG}" ] ; then
 	    echo "[DBG] Executing ${NMAP_BIN} -Pn -p \"${PORT}\" \"${NMAP_INETPROTO}\" --script ssl-enum-ciphers \"${HOST}\" | grep '^|'"
 	fi
-	
+
 	OFFERED_PROTOCOLS=$( ${NMAP_BIN} -Pn -p "${PORT}" "${NMAP_INETPROTO}" --script ssl-enum-ciphers "${HOST}" | grep '^|' )
 
 	if [ -n "${DEBUG}" ] ; then
@@ -2048,6 +2149,7 @@ main() {
 
     if ascii_grep 'sslv3\ alert\ unexpected\ message' "${ERROR}" ; then
 
+
         if [ -n "${SERVERNAME}" ] ; then
 
             # Some OpenSSL versions have problems with the -servername option
@@ -2168,11 +2270,21 @@ main() {
             if [ -n "${ISSUERS}" ]; then
                 ISSUERS="${ISSUERS}\\n"
             fi
-            # shellcheck disable=SC2086
-            ISSUERS="${ISSUERS}$(sed -ne '/-BEGIN CERTIFICATE-/,/-END CERTIFICATE-/p' "${CERT}" | \
-                               awk -v n="${CERT_IN_CHAIN}" '/-BEGIN CERTIFICATE-/{l++} (l==n) {print}' | \
-                               ${OPENSSL} "${OPENSSL_COMMAND}" ${OPENSSL_PARAMS} -issuer -noout)"
+            create_temporary_file; CHAIN_CERT=${TEMPFILE}
+            sed -ne '/-BEGIN CERTIFICATE-/,/-END CERTIFICATE-/p' "${CERT}" | \
+                               awk -v n="${CERT_IN_CHAIN}" '/-BEGIN CERTIFICATE-/{l++} (l==n) {print}' 1> ${CHAIN_CERT}
 
+            # shellcheck disable=SC2086
+            ISSUER_NAME="$(${OPENSSL} "${OPENSSL_COMMAND}" ${OPENSSL_PARAMS} -issuer -noout -in "${CHAIN_CERT}")"
+            ISSUERS="${ISSUERS}${ISSUER_NAME}"
+
+            if [ -n "${ISSUER_CHECK_EXPIRE}" ]; then
+                if [ -n "${DEBUG}" ]; then
+                    echo '[DBG] Checking expiration for '
+                    echo "${ISSUER_NAME}"
+                fi
+                check_certificate_expiration "${CHAIN_CERT}" "issuer "
+            fi
             CERT_IN_CHAIN=$(( CERT_IN_CHAIN + 1 ))
         done
     fi
@@ -2580,84 +2692,7 @@ main() {
         if [ -n "${DEBUG}" ] ; then
             echo "[DBG] Checking expiration date"
         fi
-
-        if [ "${OPENSSL_COMMAND}" = "x509" ]; then
-
-            # x509 certificates (default)
-
-            # We always check expired certificates
-            if ! ${OPENSSL} x509 -in "${CERT}" -noout -checkend 0 > /dev/null ; then
-                prepend_critical_message "${OPENSSL_COMMAND} certificate is expired (was valid until ${DATE})"
-            fi
-
-            if [ -n "${CRITICAL}" ] ; then
-
-                if [ -n "${DEBUG}" ] ; then
-                    echo "[DBG] critical = ${CRITICAL}"
-                    echo "[DBG] executing: ${OPENSSL} x509 -in ${CERT} -noout -checkend $(( CRITICAL * 86400 ))"
-                fi
-
-                if ! ${OPENSSL} x509 -in "${CERT}" -noout -checkend $(( CRITICAL * 86400 )) > /dev/null ; then
-		    EXPIRES=1
-                    prepend_critical_message "${OPENSSL_COMMAND} certificate will expire in ${DAYS_VALID} day(s) on ${DATE}"
-                fi
-
-            fi
-
-            if [ -n "${WARNING}" ] && [ -z "${EXPIRES}" ] ; then
-
-                if [ -n "${DEBUG}" ] ; then
-                    echo "[DBG] executing: ${OPENSSL} x509 -in ${CERT} -noout -checkend $(( WARNING * 86400 ))"
-                fi
-
-                if ! ${OPENSSL} x509 -in "${CERT}" -noout -checkend $(( WARNING * 86400 )) > /dev/null ; then
-                    append_warning_message "${OPENSSL_COMMAND} certificate will expire in ${DAYS_VALID} day(s) on ${DATE}"
-                fi
-
-            fi
-
-	    if [ -n "${NOT_VALID_LONGER_THAN}" ] ; then
-
-                if [ -n "${DEBUG}" ] ; then
-                    echo "[DBG] checking if the certificate is valid longer than ${NOT_VALID_LONGER_THAN} days"
-		    echo "[DBG]   valid for ${DAYS_VALID} days"
-                fi
-
-		if [ "${DAYS_VALID}" -gt "${NOT_VALID_LONGER_THAN}" ] ; then
-
-		    if [ -n "${DEBUG}" ] ; then
-			echo "[DBG] Certificate expires in ${DAYS_VALID} days which is more than ${NOT_VALID_LONGER_THAN} days"
-                    fi
-
-		    prepend_critical_message "Certificate expires in ${DAYS_VALID} days which is more than ${NOT_VALID_LONGER_THAN} days"
-		fi
-
-	    fi
-
-        elif [ "${OPENSSL_COMMAND}" = "crl" ]; then
-
-            # CRL certificates
-
-            # We always check expired certificates
-            if [ "${DAYS_VALID}" -lt 1 ] ; then
-                prepend_critical_message "${OPENSSL_COMMAND} certificate is expired (was valid until ${DATE})"
-            fi
-
-            if [ -n "${CRITICAL}" ] ; then
-                if [ "${DAYS_VALID}" -lt "${CRITICAL}" ] ; then
-		    EXPIRES=1
-                    prepend_critical_message "${OPENSSL_COMMAND} certificate will expire in ${DAYS_VALID} day(s) on ${DATE}"
-                fi
-
-            fi
-
-            if [ -n "${WARNING}" ]  && [ -z "${EXPIRES}" ] ; then
-                if [ "${DAYS_VALID}" -lt "${WARNING}" ] ; then
-                    append_warning_message "${OPENSSL_COMMAND} certificate will expire in ${DAYS_VALID} day(s) on ${DATE}"
-                fi
-
-            fi
-        fi
+        check_certificate_expiration "${CERT}"
 
     fi
 
